@@ -32,7 +32,7 @@ use crate::session::{Outcome, Session};
 pub const TICK_INTERVAL: Duration = Duration::from_millis(40);
 
 /// How often progress is written to state while playing.
-const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Default)]
 pub struct ReplOptions {
@@ -52,7 +52,7 @@ const ERASE_LINE: &[u8] = b"\r\x1b[2K";
 
 /// Which end of an over-long line to keep when it has to be shortened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Truncate {
+pub(crate) enum Truncate {
     /// Keep the beginning. Right for a status line, where `state=` and the track
     /// number are the fields worth seeing.
     Head,
@@ -71,7 +71,11 @@ enum Truncate {
 /// Width is measured in display columns rather than characters, because a CJK
 /// character is two columns wide: counting characters would let a line of Chinese
 /// text overflow a terminal that it looks short enough for.
-fn fit(text: &str, limit: usize, keep: Truncate) -> String {
+///
+/// Shared with the TUI (`tui.rs`): a pane border is just as unforgiving as a
+/// terminal row, and the same two rules apply -- never wider than the space, and
+/// keep the end that matters.
+pub(crate) fn fit(text: &str, limit: usize, keep: Truncate) -> String {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     let limit = limit.max(1);
@@ -239,7 +243,9 @@ pub fn run<W: Write>(
         // 3. Handle it. Nothing is painted yet, so whatever this prints starts at
         //    column 0.
         match event {
-            Input::Idle | Input::Redraw => {}
+            // `Chord` is a key no binding claimed. Line mode has nothing to do with
+            // it; the TUI uses it to scroll its help overlay (`tui.rs`).
+            Input::Idle | Input::Redraw | Input::Chord(_) => {}
             Input::ParseError(msg) => {
                 writeln!(out, "{msg}")?;
             }

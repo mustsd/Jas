@@ -79,6 +79,58 @@ fn version_and_help_are_well_formed() {
     assert!(out.stdout.contains("stty sane"), "{}", out.stdout);
     // And the keys, so a user can start without the README.
     assert!(out.stdout.contains("space"), "{}", out.stdout);
+    // The full-screen interface is the default on a terminal, so the way out of it
+    // has to be in `--help` rather than only in the README.
+    assert!(out.stdout.contains("--no-tui"), "{}", out.stdout);
+}
+
+#[test]
+fn a_pipe_never_gets_the_full_screen_interface() {
+    // The TUI is the default when both ends are a terminal. A pipe must stay plain
+    // lines: a script reading stdout cannot be handed alternate-screen escapes.
+    let dir = tmpdir("pipe-no-tui");
+    let file = touch(&dir, "lesson.mp3");
+    let out = run(
+        &["--no-state", file.to_str().unwrap()],
+        Some("status\nquit\n"),
+        None,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        !out.stdout.contains('\x1b'),
+        "an escape sequence reached a pipe: {:?}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("state=paused"), "{}", out.stdout);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn no_tui_keeps_the_line_oriented_interface() {
+    // `--no-tui` includes `--status-line`, which is a line-mode feature: the two
+    // together must behave exactly as they did before the TUI existed.
+    let dir = tmpdir("no-tui");
+    touch(&dir, "lesson.mp3");
+    touch(&dir, "second.mp3");
+    let out = run(
+        &[
+            "--no-state",
+            "--no-tui",
+            "--status-line",
+            dir.to_str().unwrap(),
+        ],
+        Some("status\nnext\nstatus\nquit\n"),
+        None,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("state=paused"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("track=2/2"),
+        "`next` still moves through the playlist: {}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains('\x1b'), "{}", out.stdout);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

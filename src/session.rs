@@ -237,7 +237,9 @@ impl Session {
         self.store.dir().to_path_buf()
     }
 
-    fn now(&self) -> Duration {
+    /// The monotonic time the transport is read against. Public because the TUI
+    /// (`tui.rs`) formats the position itself, from the same clock the session uses.
+    pub fn now(&self) -> Duration {
         self.clock.elapsed()
     }
 

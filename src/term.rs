@@ -8,6 +8,11 @@
 //! 2. [`install_panic_hook`] wraps the previous hook so a panic restores first.
 //! 3. [`install_signal_handlers`] restores from the signal handler before exiting.
 //!
+//! The full-screen TUI adds a second thing that must be handed back: the
+//! **alternate screen** and the hidden cursor. [`ScreenGuard`] covers it with the
+//! same three mechanisms -- RAII, the panic hook, and the signal handler -- so the
+//! TUI cannot strand a user on a blank screen any more than it can leave echo off.
+//!
 //! A hard `SIGKILL` cannot be covered by any of these, so `--help` and the README
 //! document `stty sane` as the recovery.
 //!
@@ -19,11 +24,21 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use crossterm::cursor::{Hide, Show};
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+
 use crate::error::{Error, Result};
 
 const STATE_OFF: u8 = 0;
 const STATE_RAW: u8 = 1;
 const STATE_RESTORED: u8 = 2;
+
+/// The alternate-screen state, in the same shape as `RAW_STATE`: a flag the panic
+/// hook and the signal handler can read without holding the guard.
+const ALT_OFF: u8 = 0;
+const ALT_ON: u8 = 1;
+
+static ALT_SCREEN: AtomicU8 = AtomicU8::new(ALT_OFF);
 
 static RAW_STATE: AtomicU8 = AtomicU8::new(STATE_OFF);
 static RESTORED_AT_LEAST_ONCE: AtomicBool = AtomicBool::new(false);
@@ -216,6 +231,9 @@ pub fn was_restored() -> bool {
 /// Restore the terminal from a context where no guard is reachable: a panic hook
 /// or a signal handler. Safe to call when nothing is raw.
 pub fn emergency_restore() {
+    // The alternate screen is left first: anything printed while still on it would
+    // be thrown away when the screen is switched back.
+    leave_alt_screen();
     if RAW_STATE.load(Ordering::SeqCst) == STATE_RAW {
         let _ = crossterm::terminal::disable_raw_mode();
         RAW_STATE.store(STATE_RESTORED, Ordering::SeqCst);
@@ -223,6 +241,145 @@ pub fn emergency_restore() {
         // A newline keeps the shell prompt off the line the status line used.
         let _ = io::stdout().flush();
         eprintln!();
+    }
+}
+/// The screen switches the TUI needs that raw mode does not cover.
+pub trait ScreenMode {
+    /// Take over the whole window and hide the cursor.
+    fn enter(&mut self) -> io::Result<()>;
+    /// Hand the window back and show the cursor again.
+    fn leave(&mut self) -> io::Result<()>;
+}
+
+/// The real screen, via `crossterm` on stdout.
+pub struct RealScreen;
+
+impl ScreenMode for RealScreen {
+    fn enter(&mut self) -> io::Result<()> {
+        // `execute!` flushes, so the switch is not left sitting in a buffer.
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, Hide)
+    }
+
+    fn leave(&mut self) -> io::Result<()> {
+        crossterm::execute!(io::stdout(), LeaveAlternateScreen, Show)
+    }
+}
+
+/// A stand-in used by tests, with the same shared-counter shape as [`FakeTerminal`].
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct FakeScreen {
+    on_alt: std::rc::Rc<std::cell::Cell<bool>>,
+    enter_calls: std::rc::Rc<std::cell::Cell<usize>>,
+    leave_calls: std::rc::Rc<std::cell::Cell<usize>>,
+    fail_enter: bool,
+}
+
+#[cfg(test)]
+impl FakeScreen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn failing_enter() -> Self {
+        Self {
+            fail_enter: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_on_alt(&self) -> bool {
+        self.on_alt.get()
+    }
+
+    pub fn enter_calls(&self) -> usize {
+        self.enter_calls.get()
+    }
+
+    pub fn leave_calls(&self) -> usize {
+        self.leave_calls.get()
+    }
+}
+
+#[cfg(test)]
+impl ScreenMode for FakeScreen {
+    fn enter(&mut self) -> io::Result<()> {
+        self.enter_calls.set(self.enter_calls.get() + 1);
+        if self.fail_enter {
+            return Err(io::Error::other("enter failed"));
+        }
+        self.on_alt.set(true);
+        Ok(())
+    }
+
+    fn leave(&mut self) -> io::Result<()> {
+        self.leave_calls.set(self.leave_calls.get() + 1);
+        self.on_alt.set(false);
+        Ok(())
+    }
+}
+
+/// Owns the alternate screen for as long as the TUI runs.
+///
+/// The same discipline as [`TerminalGuard`]: the object that entered is the object
+/// that leaves, and `Drop` runs it on every path, including a panic unwind. The
+/// global flag is what the panic hook and the signal handler consult, because
+/// neither can reach this guard's owner.
+pub struct ScreenGuard {
+    mode: Box<dyn ScreenMode>,
+    active: bool,
+}
+
+impl ScreenGuard {
+    /// Take over the alternate screen.
+    pub fn enter() -> Result<Self> {
+        Self::enter_with(Box::new(RealScreen))
+    }
+
+    /// The testable form: any [`ScreenMode`], taken by value.
+    pub fn enter_with(mut mode: Box<dyn ScreenMode>) -> Result<Self> {
+        match mode.enter() {
+            Ok(()) => {
+                ALT_SCREEN.store(ALT_ON, Ordering::SeqCst);
+                Ok(Self { mode, active: true })
+            }
+            Err(e) => Err(Error::runtime(format!(
+                "cannot switch to the alternate screen: {e}"
+            ))),
+        }
+    }
+
+    /// Hand the screen back now. Called by `Drop`; also callable directly when the
+    /// order matters, e.g. before printing a final message.
+    pub fn restore(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Err(e) = self.mode.leave() {
+                eprintln!("jas: warning: could not restore the screen: {e}");
+            }
+            ALT_SCREEN.store(ALT_OFF, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// True while the alternate screen is believed to be in use. Used by the pty test.
+#[cfg(test)]
+pub fn is_on_alt_screen() -> bool {
+    ALT_SCREEN.load(Ordering::SeqCst) == ALT_ON
+}
+
+/// Leave the alternate screen and show the cursor, from a context that cannot
+/// reach a [`ScreenGuard`]. Safe to call when the TUI never started.
+fn leave_alt_screen() {
+    if ALT_SCREEN.load(Ordering::SeqCst) == ALT_ON {
+        ALT_SCREEN.store(ALT_OFF, Ordering::SeqCst);
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, Show);
     }
 }
 
@@ -351,5 +508,82 @@ mod tests {
         drop(guard);
         assert!(!is_raw());
         assert!(was_restored());
+    }
+
+    // ---- The alternate screen: the TUI's other promise (R10) ----
+
+    #[test]
+    fn the_screen_guard_gives_the_window_back() {
+        let fake = FakeScreen::new();
+        {
+            let _guard = ScreenGuard::enter_with(Box::new(fake.clone())).unwrap();
+            assert!(fake.is_on_alt());
+        }
+        assert_eq!(fake.enter_calls(), 1);
+        assert_eq!(fake.leave_calls(), 1);
+        assert!(!fake.is_on_alt(), "the alternate screen survived the guard");
+    }
+
+    #[test]
+    fn the_screen_guard_restores_while_unwinding_a_panic() {
+        // The user-visible bug this prevents: a panic inside the TUI leaving a
+        // blank alternate screen with no cursor and no way back.
+        let fake = FakeScreen::new();
+        let observed = fake.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ScreenGuard::enter_with(Box::new(observed.clone())).unwrap();
+            assert!(observed.is_on_alt());
+            panic!("deliberate panic inside the TUI");
+        }));
+        assert!(result.is_err(), "the panic should have propagated");
+        assert_eq!(fake.leave_calls(), 1, "the guard must run during unwinding");
+        assert!(!fake.is_on_alt(), "the screen survived the panic");
+    }
+
+    #[test]
+    fn restoring_the_screen_twice_leaves_once() {
+        let fake = FakeScreen::new();
+        let mut guard = ScreenGuard::enter_with(Box::new(fake.clone())).unwrap();
+        guard.restore();
+        guard.restore();
+        drop(guard);
+        assert_eq!(fake.leave_calls(), 1, "restore must not run twice");
+    }
+
+    #[test]
+    fn a_failing_enter_is_a_runtime_error_not_a_panic() {
+        let result = ScreenGuard::enter_with(Box::new(FakeScreen::failing_enter()));
+        let err = match result {
+            Ok(_) => panic!("a failing enter must not produce a guard"),
+            Err(e) => e,
+        };
+        assert_eq!(err.exit_code(), crate::error::EXIT_RUNTIME);
+        assert!(
+            err.message().contains("alternate screen"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn alt_screen_tracking_follows_the_guard() {
+        // `emergency_restore` and the signal handler both read this flag, so it must
+        // not claim the alternate screen is in use after the guard has left it.
+        assert!(!is_on_alt_screen());
+        let fake = FakeScreen::new();
+        let guard = ScreenGuard::enter_with(Box::new(fake.clone())).unwrap();
+        assert!(is_on_alt_screen());
+        drop(guard);
+        assert!(!is_on_alt_screen());
+    }
+
+    #[test]
+    fn an_emergency_restore_is_safe_without_a_screen_guard() {
+        // The panic hook can fire before the TUI ever starts, and on Windows a
+        // console event can arrive at any time; neither may panic here.
+        emergency_restore();
+        emergency_restore();
+        assert!(!is_on_alt_screen());
+        assert!(!is_raw());
     }
 }

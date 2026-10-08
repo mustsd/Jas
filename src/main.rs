@@ -17,6 +17,7 @@ mod state;
 mod term;
 mod time;
 mod transport;
+mod tui;
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::AtomicBool;
@@ -138,20 +139,38 @@ fn run() -> Result<i32> {
         // Playback is started below, after the track and resume point are known.
         play: false,
     };
+
+    // Which interface? The full-screen TUI needs a terminal at both ends: stdin for
+    // the keys and stdout for the drawing. `--no-tui`, a pipe, or a redirect gets the
+    // line-oriented interface, which is the scriptable one.
+    //
+    // This is decided before the session is built because the two interfaces differ
+    // by exactly one thing from the session's point of view: where its output goes.
+    let at_a_terminal = std::io::stdin().is_terminal();
+    let full_screen = !inv.no_tui && at_a_terminal && std::io::stdout().is_terminal();
+
     // The occupancy flag is shared between the session's writer and the loop's, so
     // a message from either one clears an in-place line before it prints. Without
     // that, a confirmation would be appended to the prompt row.
     let occupied = Arc::new(AtomicBool::new(false));
+    let sink = tui::MessageSink::new();
+    let session_writer: Box<dyn Write + Send> = if full_screen {
+        // The session goes on writing lines; the TUI draws them in its message area
+        // instead of letting them land in the middle of the alternate screen.
+        Box::new(sink.clone())
+    } else {
+        Box::new(repl::ScreenWriter::new(
+            std::io::stdout(),
+            occupied.clone(),
+            term::terminal_width().unwrap_or(80),
+        ))
+    };
     let (mut session, notes) = Session::new(
         opts,
         player,
         store,
         Box::new(RealClock::new()),
-        Box::new(repl::ScreenWriter::new(
-            std::io::stdout(),
-            occupied.clone(),
-            term::terminal_width().unwrap_or(80),
-        )),
+        session_writer,
     );
 
     let mut stderr = std::io::stderr();
@@ -179,13 +198,33 @@ fn run() -> Result<i32> {
         .map(|e| e.position())
         .unwrap_or(Duration::ZERO);
 
+    // Startup notes go to stderr: they say what was restored and where the state
+    // lives, which reads the same whichever interface draws the session. When they
+    // are printed is the interface's business -- after the banner in line mode, so
+    // the transcript still starts with it, and before the alternate screen is taken
+    // in the TUI, so they are waiting on the normal screen when it comes back.
+    let mut startup_notes: Vec<String> = Vec::new();
+    if inv.verbose > 0 {
+        startup_notes.push(format!(
+            "jas: state directory {}",
+            session.store_dir().display()
+        ));
+    }
+    if let Some(entry) = &restored {
+        if !inv.quiet && entry.position_ms > 0 {
+            startup_notes.push(format!(
+                "jas: resuming at {}",
+                time::format_time(entry.position())
+            ));
+        }
+    }
+
     // 4. Interactive setup. The guard is created for a TTY only, and restores on
     //    every exit path including a panic unwind.
     //
     //    `at_a_terminal` drives echoing and in-place drawing; `inv.hotkeys` only
     //    decides which mode to start in. Conflating the two was a bug: `--no-keys`
     //    on a TTY left the user typing into a prompt that was never drawn.
-    let at_a_terminal = std::io::stdin().is_terminal();
     let mut guard = match term::TerminalGuard::enter(at_a_terminal) {
         Ok(guard) => guard,
         Err(e) => {
@@ -199,6 +238,35 @@ fn run() -> Result<i32> {
     }
 
     let mut layer = InputLayer::new(inv.hotkeys);
+
+    // ---- The full-screen interface ----
+    //
+    // It draws its own header from the session (backend, capabilities, track count),
+    // so there is no banner to print here, and its transcript is a message area
+    // rather than scrollback. The startup overrides still run first, so their
+    // confirmations are among the first messages the user sees.
+    if full_screen {
+        for note in &startup_notes {
+            writeln!(stderr, "{note}").ok();
+        }
+        if inv.shuffle {
+            sink.push(format!("shuffle seed {}", session.playlist.seed()));
+        }
+        apply_startup_overrides(&mut session, &inv, resume_at)?;
+        let code = tui::run(&mut session, &mut layer, &sink, std::io::stdout())?;
+        // Back on the normal screen before anything else is printed.
+        guard.restore();
+        session.save_progress();
+        if !inv.quiet {
+            // The alternate screen takes the transcript with it, so leave one line
+            // behind: a shell prompt with no trace of where a drill stopped is
+            // disorienting.
+            println!("{}", session.confirmation_line());
+        }
+        return Ok(code);
+    }
+
+    // ---- The line-oriented interface ----
     let mut screen = repl::ScreenWriter::new(
         std::io::stdout(),
         occupied.clone(),
@@ -212,30 +280,40 @@ fn run() -> Result<i32> {
         write!(screen, "{}", repl::banner(&session, None))?;
         screen.flush()?;
     }
-    if inv.verbose > 0 {
-        writeln!(
-            stderr,
-            "jas: state directory {}",
-            session.store_dir().display()
-        )
-        .ok();
-    }
-    if let Some(entry) = &restored {
-        if !inv.quiet && entry.position_ms > 0 {
-            writeln!(
-                stderr,
-                "jas: resuming at {}",
-                time::format_time(entry.position())
-            )
-            .ok();
-        }
+    for note in &startup_notes {
+        writeln!(stderr, "{note}").ok();
     }
     if inv.shuffle {
         writeln!(screen, "shuffle seed {}", session.playlist.seed())?;
     }
 
-    // CLI overrides win over stored state. These run *after* the banner so their
-    // confirmations appear below it rather than above.
+    apply_startup_overrides(&mut session, &inv, resume_at)?;
+
+    let repl_opts = repl::ReplOptions {
+        status_line: session.status_line_enabled() && at_a_terminal && !inv.quiet,
+        interactive: at_a_terminal,
+        // The real width is read from the terminal on each iteration.
+        fixed_width: None,
+    };
+    let code = repl::run(&mut session, &mut layer, &repl_opts, &mut screen);
+
+    // Restore before printing anything else, so the final line is on a normal
+    // terminal rather than appended to an in-place status line.
+    guard.restore();
+    session.save_progress();
+    code
+}
+
+/// Apply the command-line overrides, then get the track loaded.
+///
+/// CLI overrides win over stored state, and the confirmations they produce are output
+/// the user should see in either interface -- below the banner in line mode, in the
+/// message area of the TUI -- so both interfaces run this in the same order.
+fn apply_startup_overrides(
+    session: &mut Session,
+    inv: &Invocation,
+    resume_at: Duration,
+) -> Result<()> {
     if let Some(speed) = inv.speed {
         session.configure_speed(speed);
     }
@@ -262,20 +340,7 @@ fn run() -> Result<i32> {
         // or space bar then continues from there instead of restarting the file.
         session.prepare(resume_at)?;
     }
-
-    let repl_opts = repl::ReplOptions {
-        status_line: session.status_line_enabled() && at_a_terminal && !inv.quiet,
-        interactive: at_a_terminal,
-        // The real width is read from the terminal on each iteration.
-        fixed_width: None,
-    };
-    let code = repl::run(&mut session, &mut layer, &repl_opts, &mut screen);
-
-    // Restore before printing anything else, so the final line is on a normal
-    // terminal rather than appended to an in-place status line.
-    guard.restore();
-    session.save_progress();
-    code
+    Ok(())
 }
 /// `--list`: resolve the playlist and print it, without needing a backend.
 fn list_mode(inv: &Invocation) -> Result<i32> {

@@ -1,0 +1,42 @@
+# The full-screen interface on a real terminal, with no `--tui` flag: it is what a
+# terminal gets by default, and this scenario is what asserts that.
+#
+# It exercises the parts a pipe cannot reach at all -- the panes, the help overlay
+# and its scrolling, the `:` prompt on the bottom row -- and then leaves, so the
+# harness can check that the alternate screen and the cursor were handed back.
+#
+# 100 columns and 30 rows: wide enough for both panes side by side, tall enough for
+# the message area and the key reminder.
+#
+# Driven by `bash scripts/ainiux/check` as a regression check.
+
+cols 100
+rows 30
+track 第二课.wav
+sleep 500
+key space
+sleep 300
+key shift-right
+sleep 250
+key a
+sleep 250
+key right
+sleep 250
+key b
+sleep 250
+key c
+sleep 250
+key ?
+sleep 400
+key down
+sleep 200
+key down
+sleep 200
+key esc
+sleep 300
+keys :status
+sleep 300
+key enter
+sleep 400
+key q
+sleep 300

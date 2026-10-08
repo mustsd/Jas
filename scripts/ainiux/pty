@@ -4,22 +4,28 @@
 This exists because the interaction layout cannot be verified from a pipe: with a
 pipe, `jas` uses line mode and never paints a prompt or a status line, so every
 layout bug is invisible. A pty makes stdin a real terminal, which is the only way
-to exercise the hotkey/command-mode paths that draw in place.
+to exercise the drawn interfaces -- the line-oriented one and the full-screen TUI,
+which is what a terminal gets by default.
 
 Two things are printed:
 
 1. The raw byte stream, with `\\r` shown as `^M` and escapes spelled out. Use this
    to see exactly which bytes the program emitted.
-2. The emulated screen, replayed with `\\r`, `\\n`, and `ESC[2K`. Use this to see
-   where each line actually starts -- which is the question that matters for layout.
+2. The emulated screen, replayed the way a terminal would. Use this to see where
+   each line actually starts -- which is the question that matters for layout.
 
 Usage:
-    python3 scripts/ainiux/pty [scenario-file] [-- JAS_ARGS...]
+    python3 scripts/ainiux/pty [scenario-file] [--expect line|tui] [-- JAS_ARGS...]
+
+`--expect line` (the default) asserts the line-oriented layout and expects the
+binary to have been given `--no-tui`; `--expect tui` asserts the full-screen
+interface: that it takes and gives back the alternate screen, shows the panes, and
+emits no escape sequence outside a known set.
 
 Anything after `--` is passed to `jas`, so a second run can exercise the opt-in
 status line:
 
-    python3 scripts/ainiux/pty -- --status-line
+    python3 scripts/ainiux/pty --expect line -- --no-tui --status-line
 
 Scenarios are read from the file (or stdin, or a built-in default) as one command
 per line:
@@ -28,9 +34,10 @@ per line:
     key enter         send a named key (enter, ctrl-c, esc, space, tab, up, ...)
     sleep 300         wait, in milliseconds
     cols 60           set the terminal width (default 80)
+    rows 40           set the terminal height (default 24)
     track 第二课.wav   name the dummy track (default lesson.wav)
 
-Exits non-zero if the scenario is empty or `jas` never exits.
+Exits non-zero if the scenario is empty, an assertion fails, or `jas` never exits.
 """
 
 import fcntl
@@ -43,6 +50,7 @@ import subprocess
 import sys
 import termios
 import time
+import unicodedata
 import wave
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -91,6 +99,8 @@ def parse_scenario(text):
             steps.append(("sleep", int(rest) / 1000.0))
         elif verb == "cols":
             steps.append(("cols", int(rest)))
+        elif verb == "rows":
+            steps.append(("rows", int(rest)))
         elif verb == "track":
             steps.append(("track", rest))
         elif verb == "keys":
@@ -109,64 +119,178 @@ def parse_scenario(text):
     return steps
 
 
-def render(data, cols=80):
-    r"""Replay the byte stream onto a 2-D grid of characters.
+class Screen:
+    """A terminal, modelled closely enough to judge a frame.
 
-    Only the handful of sequences `jas` actually emits are interpreted: `\n` moves
-    to the next row at column 0, `\r` returns to column 0, and ESC[2K erases the
-    row the cursor is on. Anything else is skipped rather than guessed at.
+    Line mode could be replayed with a small state machine, because it only ever
+    writes text, carriage returns, and `ESC[2K`. The TUI addresses cells directly
+    and swaps in the alternate screen, so the model has to track a cursor, a grid,
+    and which screen is current -- otherwise "what was on screen when the program
+    quit" is not answerable at all.
 
     Wrapping is modelled, because that is the whole reason an in-place line can
     leave debris: if the text is wider than the terminal the cursor ends up on a
-    *later* row, so ESC[2K clears only that one and the row above keeps the tail of
+    *later* row, so `ESC[2K` clears only that one and the row above keeps the tail of
     the previous line. A renderer that ignored wrapping would hide exactly the class
     of bug it is meant to catch.
+
+    A double-width glyph covers the cell after it: that cell is recorded as an empty
+    string, so joining a row reproduces `第二课` rather than `第 二 课`.
     """
-    rows = [[]]
-    row = col = 0
-    i = 0
-    text = data.decode("utf-8", "replace")
-    while i < len(text):
-        c = text[i]
-        if c == "\x1b":
-            m = re.match(r"\x1b\[[0-9;]*[A-Za-z]", text[i:])
-            if m:
-                seq = m.group(0)
-                if seq in ("\x1b[2K", "\x1b[K"):
-                    # `2K` erases the whole row the cursor sits on, not just the
-                    # part to its right.
-                    rows[row] = []
-                i += len(seq)
+
+    def __init__(self, cols=80, rows=24):
+        self.cols = cols
+        self.rows = rows
+        self.grid = [self._blank()]
+        self.row = 0
+        self.col = 0
+        self.alt = False
+        self.alt_frame = None
+        self.cursor_visible = True
+        # Every CSI sequence seen, so a test can assert that nothing unexpected was
+        # emitted rather than only that the expected text arrived.
+        self.sequences = []
+
+    def _blank(self):
+        return [" "] * self.cols
+
+    def _ensure(self, row):
+        while len(self.grid) <= row:
+            self.grid.append(self._blank())
+
+    def feed(self, data):
+        text = data.decode("utf-8", "replace")
+        i = 0
+        while i < len(text):
+            c = text[i]
+            if c == "\x1b":
+                m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", text[i:])
+                if m:
+                    self.csi(m.group(1), m.group(2))
+                    i += len(m.group(0))
+                else:
+                    i += 1
                 continue
+            if c == "\n":
+                self.row += 1
+                self.col = 0
+                i += 1
+                continue
+            if c == "\r":
+                self.col = 0
+                i += 1
+                continue
+            self.put(c)
             i += 1
-            continue
-        if c == "\n":
-            row += 1
-            col = 0
-            while len(rows) <= row:
-                rows.append([])
-            i += 1
-            continue
-        if c == "\r":
-            col = 0
-            i += 1
-            continue
-        if col >= cols:
+
+    def put(self, char):
+        width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if self.col + width > self.cols:
             # The terminal wrapped: the cursor is now at column 0 of the next row.
-            row += 1
-            col = 0
-        while len(rows) <= row:
-            rows.append([])
-        line = rows[row]
-        while len(line) < col:
-            line.append(" ")
-        if col < len(line):
-            line[col] = c
+            self.row += 1
+            self.col = 0
+        self._ensure(self.row)
+        row = self.grid[self.row]
+        row[self.col] = char
+        if width == 2 and self.col + 1 < self.cols:
+            row[self.col + 1] = ""
+        self.col += width
+
+    def csi(self, params, final):
+        self.sequences.append(f"\x1b[{params}{final}")
+        numbers = [int(p) for p in params.split(";") if p.isdigit()]
+        first = numbers[0] if numbers else 0
+        if final in ("H", "f"):
+            self.row = (numbers[0] if numbers else 1) - 1
+            self.col = (numbers[1] - 1) if len(numbers) > 1 else 0
+        elif final == "A":
+            self.row = max(0, self.row - max(1, first))
+        elif final == "B":
+            self.row += max(1, first)
+        elif final == "C":
+            self.col += max(1, first)
+        elif final == "D":
+            self.col = max(0, self.col - max(1, first))
+        elif final == "G":
+            self.col = max(0, first - 1)
+        elif final == "d":
+            self.row = max(0, first - 1)
+        elif final == "K":
+            self._erase_in_line(first)
+        elif final == "J":
+            if first == 2:
+                self.grid = [self._blank()]
+        elif final in ("h", "l") and params.startswith("?"):
+            if params == "?1049":
+                self._alternate(final == "h")
+            elif params == "?25":
+                self.cursor_visible = final == "h"
+        # Everything else (SGR styling in particular) has no effect on the layout.
+
+    def _erase_in_line(self, mode):
+        self._ensure(self.row)
+        row = self.grid[self.row]
+        if mode == 2:
+            self.grid[self.row] = self._blank()
+        elif mode == 1:
+            for i in range(0, min(self.col + 1, self.cols)):
+                row[i] = " "
         else:
-            line.append(c)
-        col += 1
+            for i in range(self.col, self.cols):
+                row[i] = " "
+
+    def _alternate(self, entering):
+        if entering:
+            if self.alt:
+                return
+            self.alt = True
+            # The alternate screen starts blank and is not part of the scrollback.
+            self.grid = [self._blank()]
+            self.row = 0
+            self.col = 0
+            return
+        if not self.alt:
+            return
+        # Leaving freezes what was on it: that frame is what the TUI drew, and it is
+        # gone from a real terminal the moment the screen switches back.
+        self.alt_frame = self.rows_text(limit=self.rows)
+        self.alt = False
+        self.grid = [self._blank()]
+        self.row = 0
+        self.col = 0
+
+    def rows_text(self, limit=None):
+        rows = ["".join(row).rstrip() for row in self.grid]
+        if limit is not None:
+            rows = (rows + [""] * limit)[:limit]
+        return rows
+
+    def primary_text(self):
+        """What is left on the normal screen: the rows printed after the TUI left."""
+        return "\n".join(line for line in self.rows_text() if line.strip())
+
+
+def parse_args(argv):
+    """Split `[scenario] [--expect line|tui] [-- jas args...]`."""
+    expect = "line"
+    jas_args = []
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--":
+            jas_args = argv[i + 1 :]
+            break
+        if argv[i] == "--expect":
+            if i + 1 >= len(argv):
+                raise SystemExit("pty: --expect needs a value (line or tui)")
+            expect = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
         i += 1
-    return ["".join(r).rstrip() for r in rows]
+    if expect not in ("line", "tui"):
+        raise SystemExit(f"pty: --expect must be line or tui, not {expect!r}")
+    return rest, expect, jas_args
 
 
 def visible(data):
@@ -191,16 +315,102 @@ def visible(data):
     return "".join(out)
 
 
+# The escape sequences the TUI is allowed to emit: cursor addressing, SGR attributes,
+# erasing, and the alternate-screen and cursor switches. Anything else -- a colour, a
+# scroll region, a mouse mode, a bracketed-paste switch -- is a surprise, and the
+# program's own rule is that it emits none of them.
+ALLOWED_TUI_SEQUENCE = re.compile(r"^\x1b\[(?:[0-9;]*[HmfKJ]|\?[0-9]+[hl])$")
+
+
+def check_line_mode(screen, raw):
+    """The bugs the line-oriented assertions exist to catch."""
+    problems = []
+    # The bug: the prompt is painted without a trailing newline, so a message printed
+    # afterwards landed on the same row, after the `:`.
+    if ":state=" in raw:
+        problems.append("a message is glued to the prompt (`:state=...`)")
+
+    # In line mode the only escape sequence `jas` should ever emit is an erase-line.
+    for seq in re.findall(r"\x1b[^A-Za-z]*[A-Za-z]", raw):
+        if seq != "\x1b[2K":
+            problems.append(f"unexpected control sequence {seq!r}")
+
+    # Every status message must begin at column 0. A row that starts with a
+    # continuation of the status line means something was overwritten in place of it.
+    for index, row in enumerate(screen.rows_text()):
+        if "name=" in row and not (
+            row.startswith("state=") or row.startswith(" ") or "state=" in row
+        ):
+            problems.append(f"row {index} has an unanchored status fragment: {row!r}")
+    return problems
+
+
+def check_tui(screen, raw, track_name):
+    """The TUI's contract on a real terminal, in the order a user would notice it."""
+    problems = []
+    # R10's extension to the full-screen interface: the alternate screen and the
+    # cursor are handed back, so the shell after the session is usable.
+    if "\x1b[?1049h" not in raw:
+        problems.append("the TUI never entered the alternate screen")
+    if "\x1b[?1049l" not in raw:
+        problems.append("the TUI never left the alternate screen")
+    if "\x1b[?25h" not in raw:
+        problems.append("the cursor was never shown again")
+    if "\x1b[?25l" not in raw:
+        problems.append("the cursor was never hidden, so it sits inside the frame")
+
+    # The help overlay was opened and closed by the scenario. Nothing in the frozen
+    # frame proves it was drawn, so the stream has to. The needles are strings the
+    # overlay prints contiguously: ratatui only re-sends the cells that changed, so
+    # the title arrives as `keys`, `(1-21`, `of`, `21)` with cursor moves through the
+    # spaces between them, and a needle spanning a space would never match.
+    if not ("keymap" in raw and "`default`:" in raw and "(1-" in raw):
+        problems.append("the help overlay was never drawn")
+
+    for seq in screen.sequences:
+        if not ALLOWED_TUI_SEQUENCE.match(seq):
+            problems.append(f"unexpected control sequence {seq!r}")
+
+    frame = screen.alt_frame
+    if not frame:
+        problems.append("no frame was captured on the alternate screen")
+    else:
+        text = "\n".join(frame)
+        for needle in ["playlist:", track_name, "space play/pause", "q quit", "0:"]:
+            if needle not in text:
+                problems.append(f"the TUI frame does not show {needle!r}")
+        if len(frame) < 12:
+            problems.append(f"the frame is only {len(frame)} rows tall: {frame!r}")
+        # The message area is the block of rows just above the bottom hint row, and
+        # it has to have something in it: the session's confirmations are what make
+        # the panes more useful than a bare clock.
+        message_rows = frame[-4:-1] if len(frame) >= 5 else []
+        if not any(row.strip() for row in message_rows):
+            problems.append(f"the message area is empty: {message_rows!r}")
+        # `:status` ran inside the TUI, so its output can only be on screen if the
+        # session's writer reached the message area. This is asserted against the
+        # rendered frame rather than the byte stream: ratatui only re-sends the cells
+        # that changed, so two neighbouring characters can be separated by a cursor
+        # move whenever the new text happens to share a character with the old one at
+        # the same column -- `state=playing` really did arrive as `st`, `ate=playing`.
+        if "state=" not in text:
+            problems.append("the output of `:status` is not in the message area")
+
+    # The transcript goes away with the alternate screen, so the session leaves one
+    # line behind on the normal screen; without it a finished drill looks like it
+    # never ran.
+    if "0:" not in screen.primary_text():
+        problems.append(
+            f"nothing was left on the normal screen: {screen.primary_text()!r}"
+        )
+    return problems
+
+
 def main():
     if not os.path.exists(BIN):
         raise SystemExit(f"pty: {BIN} does not exist; run `bash scripts/ainiux/cargo build`")
 
-    argv = sys.argv[1:]
-    jas_args = []
-    if "--" in argv:
-        split = argv.index("--")
-        jas_args = argv[split + 1 :]
-        argv = argv[:split]
+    argv, expect, jas_args = parse_args(sys.argv[1:])
 
     if argv:
         with open(argv[0], "r", encoding="utf-8") as handle:
@@ -223,13 +433,17 @@ def main():
     for kind, value in steps:
         if kind == "cols":
             cols = value
+        elif kind == "rows":
+            rows = value
         elif kind == "track":
             track_name = value
 
     # A real but silent WAV. It has to be genuinely valid audio: `ffplay` is
     # actually spawned by commands like `next`, and a malformed file would make it
     # exit with a decode error, which is a different situation than the one under
-    # test. One second of silence keeps the run quick and audibly quiet.
+    # test. It is long on purpose -- thirty seconds, not one -- because a track that
+    # ends mid-scenario prints a restart confirmation, and that unrelated message can
+    # push the message an assertion is looking for out of a three-row message area.
     workdir = os.path.join(REPO, "target", "pty-run")
     os.makedirs(workdir, exist_ok=True)
     track = os.path.join(workdir, track_name)
@@ -237,7 +451,7 @@ def main():
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(8000)
-        handle.writeframes(b"\x00\x00" * 8000)
+        handle.writeframes(b"\x00\x00" * 8000 * 30)
 
     argv = [BIN, "--no-state", *jas_args, track]
 
@@ -278,9 +492,7 @@ def main():
 
     drain(0.4)
     for kind, value in steps:
-        if kind == "cols":
-            continue
-        if kind == "track":
+        if kind in ("cols", "rows", "track"):
             continue
         if kind == "sleep":
             drain(value)
@@ -300,18 +512,45 @@ def main():
         raise SystemExit("pty: jas did not exit; the scenario left it running")
     os.close(master)
 
+    # Replay the stream into a screen model. Both interfaces are replayed the same
+    # way; only the assertions differ.
+    screen = Screen(cols, rows)
+    screen.feed(bytes(captured))
+    raw = bytes(captured).decode("utf-8", "replace")
+
     print("== scenario")
     for line in scenario_text.strip().splitlines():
         print(f"  {line}")
     print(f"== jas args: {' '.join(jas_args) if jas_args else '(none)'}")
+    print(f"== expect: {expect}")
     print(f"== terminal: {cols}x{rows}, track: {track_name}")
     print()
-    print("== raw stream (^M = carriage return, \\e = escape)")
-    print(visible(bytes(captured)))
-    print()
-    print("== rendered screen")
-    for index, row in enumerate(render(bytes(captured), cols)):
-        print(f"{index:>3} |{row}")
+
+    if expect == "tui":
+        # The frame the TUI drew is frozen when it leaves the alternate screen. The
+        # raw stream would be hundreds of cursor moves, which is noise rather than
+        # evidence, so it is summarised instead.
+        print(f"== alternate-screen frame (last {len(screen.alt_frame or [])} rows drawn)")
+        for index, row in enumerate(screen.alt_frame or []):
+            print(f"{index:>3} |{row}")
+        print()
+        print("== normal screen after the TUI left")
+        for row in screen.primary_text().splitlines():
+            print(f"   |{row}")
+        print()
+        # Kinds, not instances: 800 cursor moves are not a report. `N` stands for the
+        # numeric parameters, so `\x1b[H` means "some cursor address".
+        kinds = sorted({re.sub(r"[0-9;?]+", "N", seq) for seq in screen.sequences})
+        print(f"== escape sequences used ({len(kinds)} kinds, {len(screen.sequences)} total)")
+        for seq in kinds:
+            print(f"   {seq!r}")
+    else:
+        print("== raw stream (^M = carriage return, \\e = escape)")
+        print(visible(bytes(captured)))
+        print()
+        print("== rendered screen")
+        for index, row in enumerate(screen.rows_text()):
+            print(f"{index:>3} |{row}")
     print()
     print(f"== exit code: {proc.returncode}")
 
@@ -321,32 +560,20 @@ def main():
     problems = []
     if proc.returncode != 0:
         problems.append(f"jas exited {proc.returncode}")
-
-    raw = bytes(captured).decode("utf-8", "replace")
-    # The bug: the prompt is painted without a trailing newline, so a message
-    # printed afterwards landed on the same row, after the `:`.
-    if ":state=" in raw:
-        problems.append("a message is glued to the prompt (`:state=...`)")
-
-    # The only escape sequence `jas` should ever emit is an erase-line.
-    for seq in re.findall(r"\x1b[^A-Za-z]*[A-Za-z]", raw):
-        if seq != "\x1b[2K":
-            problems.append(f"unexpected control sequence {seq!r}")
-
-    # Every status message must begin at column 0. A row that starts with a
-    # continuation of the status line means something was overwritten in place of it.
-    for index, row in enumerate(render(bytes(captured), cols)):
-        if "name=" in row and not (
-            row.startswith("state=") or row.startswith(" ") or "state=" in row
-        ):
-            problems.append(f"row {index} has an unanchored status fragment: {row!r}")
+    if expect == "tui":
+        problems.extend(check_tui(screen, raw, track_name))
+    else:
+        problems.extend(check_line_mode(screen, raw))
 
     if problems:
         print()
         for problem in problems:
             print(f"FAIL: {problem}")
         return 1
-    print("== ok: no glued lines, no unexpected escapes")
+    if expect == "tui":
+        print("== ok: panes drawn, alternate screen returned, no unexpected escapes")
+    else:
+        print("== ok: no glued lines, no unexpected escapes")
     return 0
 
 

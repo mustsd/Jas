@@ -4,7 +4,9 @@ Jas is a local audio player primarily for language learners on macOS, Linux, and
 
 - Plays mp3 and other common audio formats.
 - Playlist loops by default.
-- CLI only: it runs on the command line and draws no TUI or GUI.
+- CLI first: it runs on the command line, and a pipe or a redirect gets line-oriented
+  output and nothing else. On a terminal it draws a full-screen interface over the same
+  session, which `--no-tui` turns off.
 
 This document is the working plan. It records the decisions that are locked, the
 architecture they imply, and the milestones with acceptance criteria. Anything not
@@ -26,26 +28,36 @@ an end-to-end smoke script against the built binary.
 | M4 interactive mode, `:` prompt, line editor, `--status-line`, non-TTY mode | done |
 | M5 optional `native` backend | not started, still optional |
 | M6 packaging, README, `docs/backends.md` | README done; `docs/backends.md` not written |
+| M7 full-screen interface (`tui.rs`), default on a terminal, `--no-tui` to opt out | done on macOS; **unverified on Windows** |
+
+M7 is new: the first version of this plan listed a TUI as a non-goal (section 2), and
+the reversal is recorded there and in section 5.2 rather than being quietly dropped.
 
 Verification status, stated precisely because it matters:
 
-- `cargo test`: 294 unit tests + 21 integration tests (`tests/cli.rs`), all passing on
+- `cargo test`: 342 unit tests + 23 integration tests (`tests/cli.rs`), all passing on
   macOS with `ffplay` installed. These include a real `ffplay` playback test that
   spawns the player against generated audio and asserts the respawn contract.
 - `bash scripts/ainiux/smoke`: 20 end-to-end checks against the built binary.
-- `python3 scripts/ainiux/pty`: drives the real binary on a pty (80 columns, and 40
-  columns with a double-width CJK filename) and asserts that no message is glued to
-  the prompt, that no unexpected escape sequence is emitted, and that `jas` exits
-  cleanly. A pipe cannot exercise the in-place drawing at all, so this is the only
+- `python3 scripts/ainiux/pty`: drives the real binary on a pty and asserts the
+  layout it drew. Line mode (`--expect line`) is checked at 80 columns and at 40
+  columns with a double-width CJK filename; the full-screen interface
+  (`--expect tui`, no `--no-tui`, so it is also the check that the TUI is the
+  default) is checked at 100x30 by freezing the frame it drew when it left the
+  alternate screen. A pipe cannot exercise any of that drawing, so this is the only
   automated check of the interactive layout.
 - `bash scripts/ainiux/check` runs all of the above.
 - `docs/backends.md` documents the per-backend contract.
 - **Not verified**: the mpv path (mpv is not installed on the development machine,
-  so those two integration tests print `skipping` and return); Windows behaviour of
-  any kind (including Ctrl+C, console restore, and named-pipe IPC); the termios
-  round-trip of terminal restore (the pty harness drives a real terminal but reads
-  output, it does not inspect termios); and audio *quality* claims, which no test can
-  assert.
+  so those two integration tests print `skipping` and return); the full-screen
+  interface on Windows, where the alternate screen goes through the Win32 console
+  API that has never been run here; the "TTY stdin, redirected stdout" case, which
+  takes the line-oriented path by construction but has no check of its own; Windows
+  behaviour of any kind (including Ctrl+C,
+  console restore, and named-pipe IPC); the termios round-trip of terminal restore
+  (the pty harness drives a real terminal but reads output, it does not inspect
+  termios, so neither raw mode nor the alternate screen is checked as a *state*);
+  and audio *quality* claims, which no test can assert.
 
 ## 1. Stack (locked)
 
@@ -55,6 +67,9 @@ Verification status, stated precisely because it matters:
   codecs or players.
 - Interaction: one command grammar reachable three ways -- single-key hotkeys on a
   TTY, a `:` command prompt, and piped/flags-only scripting. See section 5.2.
+- Interface: a full-screen TUI on a terminal (default; `--no-tui` opts out) and a
+  line-oriented one everywhere else. Both drive the same `Session`, so the interface
+  changes what you see, never what the transport does.
 
 Crate choices (small, widely used, no heavyweight runtime):
 | Need | Crate |
@@ -64,6 +79,7 @@ Crate choices (small, widely used, no heavyweight runtime):
 | Error types | `thiserror` for library errors, `anyhow` at the binary edge |
 | Config/state directory | `directories` |
 | Terminal raw mode + cross-platform key events | `crossterm` |
+| Full-screen rendering | `ratatui` (0.27, `default-features = false, features = ["crossterm"]`) |
 | Line editing for the `:` prompt | in-house, on `crossterm` events (see 5.2) |
 | Display width of a line (CJK is two columns) | `unicode-width` |
 | Ctrl+C / console events | `ctrlc` |
@@ -73,12 +89,23 @@ Crate choices (small, widely used, no heavyweight runtime):
 Honesty note on "single static binary": on Linux the target is
 `x86_64-unknown-linux-musl`, but the optional `native` feature links ALSA and
 therefore glibc. The default build (external backends only) is genuinely static.
+`ratatui` is pinned to the version whose crossterm requirement is the 0.27 the rest
+of the program uses, so the dependency tree holds **one** crossterm: a second copy
+would be a second terminal library to disagree with about termios, which is exactly
+the failure the in-house line editor exists to avoid (5.2). It is built with only the
+crossterm backend and draws no colour, so the feature set is smaller than the default
+one.
 
 ## 2. Non-goals (v1)
 
-- No GUI, no TUI, no web UI. Output is always line-oriented plain text or JSON.
-  Single-key hotkeys are not a TUI: no cursor addressing, no screen layout, no redraw
-  loop. At most one status line is rewritten in place with `\r`, and only on a TTY.
+- No GUI, no web UI.
+- **No TUI was the original v1 non-goal, and it has been reversed deliberately.** The
+  plan said "no cursor addressing, no screen layout, no redraw loop"; the full-screen
+  interface (section 5.2, milestone M7) is now the default on a terminal. What the
+  non-goal was protecting is still protected: a pipe, a file, or a redirect gets
+  line-oriented output with no escape sequences at all, `--no-tui` gives a terminal
+  the old interface, and the TUI is a *view* over the one session -- it adds no
+  second command grammar, no second input layer, and no second state store.
 - No library management (tag editing, artwork, ratings, scanning).
 - No streaming sources (URLs, podcasts, internet radio).
 - No mobile targets, no recorder, no transcription, no speech analysis.
@@ -100,7 +127,8 @@ The three bullets in the brief expand into these v1 requirements:
 | R7 | Run on macOS, Linux, and Windows with the same commands and flags. |
 | R8 | Handle non-ASCII paths (Arabic, Chinese, emoji) without corruption on every platform. |
 | R9 | Provide interactive control: single-key hotkeys on a TTY plus a `:` command prompt covering the whole command grammar. |
-| R10 | Never leave the terminal in raw mode on any exit path: quit, error, panic, or signal. |
+| R10 | Never leave the terminal in raw mode, on the alternate screen, or with the cursor hidden on any exit path: quit, error, panic, or signal. |
+| R11 | On a terminal, provide a full-screen interface over the same session and the same command grammar, with `--no-tui` as the way out; a pipe, a file, or a redirect never sees a single escape sequence. |
 
 ## 4. Architecture
 
@@ -115,7 +143,8 @@ src/
   lineedit.rs      line buffer + history: (buf, key) -> (buf, effect) (pure)
   input.rs         the single input layer: TTY events or stdin lines; mode switch
   term.rs          RAII terminal guard: restore on drop, panic, and signal
-  repl.rs          session loop, screen discipline (ScreenWriter), status line
+  repl.rs          line-mode loop, screen discipline (ScreenWriter), status line
+  tui.rs           full-screen loop: panes, message sink, help overlay (ratatui)
   time.rs          time literal parsing and formatting (pure)
   playlist.rs      loaders, natural sort, seeded shuffle, loop modes, navigation
   transport.rs     logical position clock and play state machine (pure)
@@ -137,19 +166,40 @@ scripts/ainiux/
   test one                 test-suite helpers (tail output / single exact test)
   smoke                    end-to-end checks against the built binary
   pty                      drive the real binary on a pty and assert the layout
+                            (`--expect line` and `--expect tui`)
   pty-narrow.txt           the 40-column, CJK-filename pty scenario
+  pty-tui.txt              the 100x30 full-screen pty scenario
   backends                 report which backend-dependent tests ran vs. skipped
 ```
 
 Separation of concerns: `player/*` does audio I/O and nothing else; `transport.rs`
-owns time and play state; `session.rs` wires everything; `repl.rs`, `input.rs`, and
-`main.rs` do I/O only. `commands.rs`, `keys.rs`, `lineedit.rs`, `time.rs`,
-`transport.rs`, and `playlist.rs` are pure and account for most of the unit tests.
+owns time and play state; `session.rs` wires everything; `repl.rs`, `tui.rs`,
+`input.rs`, and `main.rs` do I/O only. `commands.rs`, `keys.rs`, `lineedit.rs`,
+`time.rs`, `transport.rs`, and `playlist.rs` are pure and account for most of the
+unit tests.
 
 The one place that is *not* purely separated is `session.rs`, whose writer is a
 `ScreenWriter` sharing an occupancy flag with the loop's. That is deliberate: the
 session prints confirmations and errors, and it cannot know whether the loop has an
 in-place line on screen. See the layout rules in section 5.2.
+
+`tui.rs` is the second consumer of that writer, and keeps the same discipline: the
+session's output goes to a `MessageSink` (a `Write` that keeps lines instead of
+printing them) and the TUI draws the tail of it. So the session still does not know
+which interface is in front of it, and the TUI adds no behaviour to it.
+
+Two decisions in `tui.rs` are worth stating because they are the ones a reader would
+try to "improve" back:
+
+- **The playlist pane has no cursor of its own.** Its selection is the transport's
+  current track, and navigation stays `next`/`prev`/`goto`. A second cursor would
+  need keeping in step with the transport, and the two would disagree the first time
+  a track ended on its own.
+- **The two panes are rectangles computed by hand, not a `Layout`.** The split is one
+  expression (`38%` of the width, or nothing below 60 columns) and the degenerate
+  sizes are easier to test as arithmetic than to reason about through a constraint
+  solver. The one piece of layout that does use percentages -- the overlay -- is a
+  pure `centered_rect` function with its own tests.
 
 One deviation from the plan as first written: `keys.rs` defines its own
 `Chord { code, mods }` rather than taking `crossterm::KeyEvent`. `input.rs` is then
@@ -271,7 +321,8 @@ section 5.2 has the table that decides which input mode is used.
 | `--backend <auto\|mpv\|ffplay\|native>` | Force a backend. `native` is not built into this binary. |
 | `--keys <default\|mpv\|off>` | Keymap preset for hotkey mode; `off` is the same as `--no-keys`. |
 | `--no-keys` | Start in command mode with hotkeys disabled. |
-| `--status-line` | Keep one status line updated in place with `\r` (TTY only). |
+| `--status-line` | Keep one status line updated in place with `\r` (line-mode interface, TTY only). |
+| `--no-tui` | Start in the line-oriented interface instead of the full-screen one. |
 | `--no-state` | Do not read or write resume state. |
 | `--config <PATH>` | Use an alternate config/state **directory**. |
 | `-q` / `-v` / `--version` / `-h` | Quiet, verbose, version, help. |
@@ -284,6 +335,16 @@ making a sound. Add `--play` for the scripted case.
 | `-q` / `-v` / `--version` / `-h` | Quiet, verbose, version, help. |
 
 ### 5.2 Interactive mode
+
+Two things are decided here: *which interface* draws the session, and *which input
+mode* feeds it. They are separate questions, and both answer themselves rather than
+needing a flag.
+
+| stdin | stdout | interface |
+|---|---|---|
+| TTY | TTY | **full-screen TUI** (the default); `--no-tui` gives the line-oriented one |
+| TTY | not a TTY (`> log`) | line-oriented: cursor addressing cannot go into a file |
+| pipe or file | either | line-oriented; a script's output stays parseable |
 
 There is exactly one input layer, and two ways to feed it. Which one you get depends
 on stdin, not on a flag you have to remember:
@@ -374,6 +435,41 @@ Three smaller rules fall out of the same reasoning:
   and "are hotkeys on?" are different questions; conflating them left `--no-keys`
   typing blind.
 
+#### The full-screen interface
+
+The TUI is the default on a terminal and is a *view* of the same session: keys still
+go through `input.rs`, so a hotkey is still the same `Command` the parser produces,
+and `:` opens the same prompt, on the bottom row. What it adds:
+
+- A playlist pane (selection = the transport's current track; no second cursor), a
+  now-playing pane (name, a progress bar with the A and B marks drawn in it, position
+  and duration, speed, repeat, gap, loop mode, backend), a three-row message area
+  holding the tail of the session's output, and a bottom row that is the `:` prompt in
+  command mode and the key reminder otherwise.
+- A help overlay for `?`, `help`, `help keys`, and `keys`. It shows the text those
+  commands print -- `commands::HELP` and `Keymap::render()` -- so the overlay cannot
+  disagree with the CLI. Esc (either spelling), `?`, space, Enter or `q` close it;
+  `↑`/`↓`, `j`/`k`, or `n`/`p` scroll it.
+- **No colour**, only bold and reverse, so `NO_COLOR` stays satisfied by construction
+  rather than by a check.
+- Messages are lines rather than bytes on stdout: the session keeps writing to a
+  `Write`, but in the TUI that writer is a sink and the message area draws its tail.
+  A confirmation or an error is therefore visible instead of landing in the middle of
+  the frame.
+- One line is left on the normal screen when the TUI exits (state and position),
+  because the alternate screen takes the transcript with it.
+
+Degradation is explicit rather than emergent: below 60 columns the playlist pane is
+dropped rather than squeezed, and below 12x3 the frame becomes a single state line.
+The layout is a pure function of a `View` struct, which is what lets six window
+sizes -- down to 1x1 -- be asserted in unit tests instead of by hand.
+
+Two rules carry over from the line-oriented interface unchanged: the message area
+keeps the *tail* of the output (three rows cannot show a transcript), and no line is
+ever drawn wider than the space it has, so a pane border cannot be pushed onto the
+next row. The single-row behaviours above still matter for line mode, and the
+`--status-line` readout is line-mode only.
+
 ### 5.3 Default key bindings
 
 The one-key layer, aimed at the drill loop: play/pause, nudge, mark the phrase, repeat
@@ -393,7 +489,8 @@ it.
 | `g` | `gap +250` | inter-repeat gap, 250 ms per press |
 | `l` | `loop` | cycles off -> all -> one |
 | `:` | *(mode switch)* | enters the command prompt; not a bindable key |
-| `?` | `help keys` | keymap + command list |
+| `?` | `help keys` | keymap + command list (the help overlay in the TUI) |
+| `Esc` / `↑` `↓` | *(overlay)* | close / scroll the help overlay; TUI only |
 | `q` / `Ctrl+D` | `quit` | exit code 0, like `quit` |
 | `Ctrl+C` | *(interrupt)* | exit code 130, terminal restored first |
 
@@ -409,6 +506,13 @@ it.
 - `:` and `Ctrl+C` are deliberately *not* keymap entries. They are mode transitions
   handled by the input layer, so no config can make the full command grammar
   unreachable or make Ctrl+C stop meaning "get me out".
+- **The overlay is not a second keymap.** In the TUI, `?`, `help`, `help keys`, and
+  `keys` open an overlay showing the same text those commands print, from the same
+  source (`commands::HELP`, `Keymap::render()`), so the two interfaces cannot disagree
+  about what a key does. While it is open it takes every key except Ctrl+C; Esc (`?`,
+  space, Enter and `q` also work) closes it, and the arrows scroll it. A key it does
+  not know is swallowed rather than passed to the session, because a stray `n` while
+  reading the help must not skip a track behind it.
 - Control keys are normalized before lookup: terminals report `Ctrl+C` either as
   `CONTROL + 'c'` or as the raw code point `U+0003`, and both must be the same
   chord, or the quit key would only sometimes work.
@@ -428,7 +532,7 @@ jas --play mix.m3u < drill.txt
 | `gap <MS>` / `gap +MS` / `gap -MS` | | Inter-repeat gap, absolute or relative. |
 | `loop [off\|all\|one]` | | Loop mode; with no value it cycles. |
 | `shuffle [on\|off]` | | Reshuffle; with no value it toggles. |
-| `list` / `status` / `save` / `backend` / `keys` | `ls`, `st` | Info and session control; `keys` prints the active keymap. |
+| `list` / `status` / `save` / `backend` / `keys` | `ls`, `st` | Info and session control; `keys` prints the active keymap (and opens the overlay in the TUI). |
 | `help [keys]` / `quit` | `?`, `q`, `x` | Help (keymap and commands) and exit. |
 
 Two grammar notes worth stating because they were wrong in an earlier draft of this
@@ -449,7 +553,14 @@ the intuitive behaviour.
 | `help [keys]` / `quit` | `?`, `q`, `x` | Help (keymap and commands) and exit. |
 
 `status` is one machine-readable line (track index, name, position, duration,
-state, speed, A-B, loop) so users can log drill sessions.
+state, speed, A-B, loop) so users can log drill sessions. In the TUI it lands in the
+message area instead of on stdout; the *text* is the same, so a drill log can be built
+from either interface.
+
+`help`, `help keys`, and `keys` are the one place the interface changes the shape of
+the answer: line mode prints the text as rows, the TUI shows it in a scrollable
+overlay. The text itself comes from one place in both cases (`commands::HELP` and
+`Keymap::render()`), which is what keeps the shortcut from becoming a second copy.
 
 The **Aliases** column is empty wherever a hotkey uses the same letter for a
 *different* action, and that is deliberate: the keymap (5.3) is the one-key layer, so a
@@ -545,20 +656,29 @@ bare code.
   session -- both hotkey and command mode consume `crossterm` events. Non-TTY stdin
   gets line mode with no prompts and never touches terminal settings. Output stays
   newline-delimited (machine-parseable) except the opt-in `--status-line`, which is
-  TTY-only, uses `\r`, and is cleared on exit.
+  TTY-only, uses `\r`, and is cleared on exit. In the TUI, raw mode is joined by the
+  alternate screen and a hidden cursor, both owned by `term::ScreenGuard` and both
+  handed back on the same paths (see R10 below); a redirect of stdout disables the TUI
+  even when stdin is a terminal, so no cursor addressing can be written into a file.
 - **Colour**: no colour is emitted at all in this version, so `NO_COLOR` has nothing
   to suppress. The requirement is met by construction rather than by a check.
 - **Terminal restore** (R10): `term.rs` leaves raw mode via RAII on drop, on panic, and
   from the signal handler, so Ctrl+C, an error, or a panic cannot leave a shell with
   echo off. The guard *owns* the object that enabled raw mode, so it cannot report
-  success while restoring something else. `SIGKILL` is explicitly out of scope and
-  `stty sane` is documented in `--help`.
+  success while restoring something else. The TUI adds a second guard in the same
+  shape -- alternate screen and cursor -- for the same reason: a panic inside the TUI
+  used to be able to leave a blank screen with no cursor and no way back. The two share
+  one `emergency_restore` (screen first, then raw mode, so a message printed during
+  recovery is not thrown away with the screen). `SIGKILL` is explicitly out of scope
+  and `stty sane` is documented in `--help`.
 - **Line endings**: emit `\n`; accept `\r\n` in command input and m3u files.
 - **Keyboard on Windows**: `crossterm` covers console mode and key decoding, so there
   is no `termios` code path, but Ctrl+C arrives as a key event rather than a signal.
   Key *release* events are ignored, because Windows reports both press and release
   and acting on both would run every action twice. **Unverified on Windows**:
-  Ctrl+C, Ctrl+D, and console-restore behaviour have never been run there.
+  Ctrl+C, Ctrl+D, and console-restore behaviour have never been run there, and neither
+  has the full-screen interface, whose alternate screen goes through the Win32 console
+  API rather than an escape sequence.
 
 ## 10. Testing strategy
 
@@ -607,23 +727,44 @@ bare code.
    `scripts/ainiux/smoke` adds 20 shell-level checks including real audio generation.
 7. **pty layout harness** (`scripts/ainiux/pty`): spawns the real binary attached to a
    real pty, sends keystrokes from a small scenario DSL, and replays the output into a
-   rendered screen. It asserts the user-visible invariants -- no message glued to the
-   prompt, no unexpected escape sequence, clean exit -- at two sizes, one of them 40
-   columns with a double-width CJK filename. This is the only automated check of the
-   interactive drawing: on a pipe there is no prompt and no status line at all, so
-   every layout bug is invisible to the tests above.
+   screen model. `--expect line` asserts the line-mode invariants -- no message glued to
+   the prompt, no escape sequence other than `ESC[2K`, clean exit -- at two sizes, one
+   of them 40 columns with a double-width CJK filename. `--expect tui` asserts the
+   full-screen interface instead, by modelling the alternate screen: the frame is
+   captured at `ESC[?1049l` (after which a real terminal has already thrown it away),
+   the sequences emitted are checked against an allowlist, and the one line left on the
+   normal screen is checked. This is the only automated check of the interactive
+   drawing: on a pipe there are no panes, no prompt, and no status line at all, so every
+   layout bug is invisible to the tests above.
    **Still not done**: asserting the termios round-trip (raw mode restored after `q`,
-   Ctrl+C, and a forced panic). The guard's logic is unit-tested against a fake
-   terminal including a panic unwind; this harness could be extended to check the real
-   one, and that is the next thing to add here.
-8. **Edge cases required by policy**: empty playlist, one very long track, boundary
+   Ctrl+C, and a forced panic) or the terminal *state* after the alternate screen is
+   left. The guards' logic is unit-tested against a fake terminal including a panic
+   unwind; this harness could be extended to check the real one, and that is the next
+   thing to add here.
+8. **Full-screen interface tests** (`tui.rs` + the pty harness): the layout is a pure
+    function of a `View` struct, so it is rendered into ratatui's `TestBackend` -- no
+    terminal, no session, no timing -- and asserted on the rows a user would see: the
+    panes' content, the message area's bottom alignment, the overlay's opacity and
+    scroll extent, the cursor's column in command mode, and six window sizes down to
+    1x1. The pure parts have their own tests: the progress bar is exactly the width it
+    is given (a bar one column too wide pushes a pane border onto the next row), `A`
+    and `B` land where the fractions say, the overlay rectangle never escapes the
+    window, and the message sink keeps lines, caps its history, and shows a line that
+    has not ended yet. On a real terminal, `scripts/ainiux/pty --expect tui` freezes the
+    frame drawn when the alternate screen is left and asserts the panes, the message
+    area, the overlay, the escape sequences used (cursor addressing and attributes
+    only, no colour), and that the screen and cursor were returned. **Not done**: the
+    same check on Windows, and asserting the termios/console *state* after exit rather
+    than the sequences that should have produced it.
+9. **Edge cases required by policy**: empty playlist, one very long track, boundary
    times (`00:00`, exactly the duration, past the end), invalid input (`seek abc`,
    `speed 0`, negative values, an unparseable keymap entry), and a backend that dies
    mid-track. A permission-denied file is reported by the loader; there is no
    dedicated test for it. A zero- and one-column terminal is covered by the fitting
    tests.
-9. **CI**: `bash scripts/ainiux/check` runs `cargo fmt --check`,
-   `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the smoke script.
+10. **CI**: `bash scripts/ainiux/check` runs `cargo fmt --check`,
+    `cargo clippy --all-targets -- -D warnings`, `cargo test`, the two pty checks in
+    line mode, the pty check of the full-screen interface, and the smoke script.
    **Not done**: the three-platform matrix and release builds on tags. Everything
    recorded here was produced on macOS.
 
@@ -638,6 +779,7 @@ bare code.
 | M4 | Interactive mode complete: `:` prompt, in-house line editor and history, full keymap and config overrides, `--keys`/`--no-keys`, `--status-line`, non-TTY stdin mode, `status` contract, Unicode path tests, and the layout rules in 5.2. | Every key in 5.3 is exercised by a test and maps to a parser-accepted command; the prompt echoes and no message is glued to it; `jas --play list.m3u < drill.txt` runs headless. |
 | M5 | Optional `native` feature: ffmpeg decode -> PCM -> cpal. | Sample-accurate A-B loop with no external player process; feature is off by default. |
 | M6 | Packaging: release builds, README/`--help` accuracy, `docs/backends.md`. | A user with only ffmpeg installed can play, drill, and resume by following the README alone. |
+| M7 | Full-screen interface over the same session: panes, message area, help overlay, `--no-tui`, and R10 extended to the alternate screen and the cursor. | It is the default when stdin and stdout are terminals; a pipe or a redirect stays free of escape sequences; the pty check freezes the frame it drew and proves the screen and the cursor came back. |
 
 (Per-milestone status is in section 0.)
 
@@ -654,6 +796,10 @@ What the milestones still owe, stated plainly rather than implied:
 - M4's "Arabic and Chinese filenames verified on all three platforms" is met on one
   platform.
 - M6 is met except for the release-build check.
+- M7 is met on one platform and in one direction: the pty check asserts the
+  *sequences* that leave the alternate screen and show the cursor, not the terminal
+  state they produce, and nothing here has been run on Windows, where the alternate
+  screen is a console-API call rather than an escape sequence.
 
 ## 12. Risks
 
@@ -667,6 +813,9 @@ What the milestones still owe, stated plainly rather than implied:
 | "Single static binary" is false for the `native` feature on Linux. | Misleading docs and support load. | Feature off by default; the limitation is stated in the README and in 4.3. |
 | Windows process tree and Ctrl+C handling. | Orphan players keep making noise after exit. | A `ctrlc` handler stops the child first, and a dropped player kills its child. **Job objects are not implemented**, and no test asserts no leftover process on Windows. |
 | Non-UTF-8 or RTL paths. | Corrupt or unopenable paths. | `OsString`/`PathBuf` end to end; `encode_path` percent-encodes invalid UTF-8 so two distinct paths cannot collide as state keys. Unicode tests exist on one platform, not three. |
+| The TUI and the line-oriented interface drift apart (different key hints, different help text, a feature only reachable in one of them). | A user in one interface cannot do what the README describes. | Both drive the same `Session` and the same `InputLayer`, so a hotkey is one `Command` and nothing is reachable only by a keypress; the overlay renders `commands::HELP` and `Keymap::render()`, the same text line mode prints; and both interfaces have assertions on the same content (the TUI's via `TestBackend`, line mode's via the pty checks). |
+| A second terminal owner (a rendering library that also toggles termios or decodes keys). | Broken terminal, dropped keystrokes, double-handled keys. | `ratatui` is pinned to the release whose crossterm requirement is the 0.27 already in use, so the tree holds one crossterm; raw mode and the alternate screen are owned by `term.rs`, not by the renderer; and the renderer is given a `Write`, so it never opens a descriptor of its own. |
+| Three message rows hide an error that has already scrolled past. | The user does not see why playback stopped. | The message area always shows the *newest* output, and an error is written through the same sink as everything else; `status` is one `:` away for the full readout. Still a real limitation: a long transcript is not readable in the TUI (open question 15). |
 | Timing-sensitive tests become flaky. | CI noise, ignored failures. | `FakePlayer` plus an injected clock by default; real-backend tests are gated and tolerance-based. The one loop test that must end uses a clock that advances on every read rather than sleeping. |
 | Corrupt state file. | Start-up failure. | Atomic writes, move-aside on parse failure, `--no-state` escape hatch. Unknown JSON fields are ignored so an older Jas can read a newer file. |
 | A backend that dies mid-track leaves the session spinning. | The error is re-reported forever and no input ends the run. | **Found and fixed**: the session stops the transport when the child is gone, so the error is reported once and the loop exits with code 2. |
@@ -702,3 +851,13 @@ What the milestones still owe, stated plainly rather than implied:
 13. With `--status-line` and a terminal narrow enough that the line must be cut, is
     the field-boundary truncation the right call, or should the readout switch to a
     short form (position and state only) below some width?
+14. Should the TUI's message area be a scrollable log pane instead of three rows? It
+    would make `list`, `help`, and a long run of confirmations readable, at the cost of
+    a pane the transport does not need. The chosen layout keeps the frame simple and
+    accepts that only the newest messages are visible.
+15. Should the playlist pane be navigable (select a track, Enter to play it)? Today it
+    is a view of the transport, which keeps one cursor; a second cursor would need
+    keeping in step with `next`/`prev` and with a track ending on its own.
+16. Should `config.json` gain a `tui` key, so a user who prefers the line interface
+    does not have to remember `--no-tui` every time? The flag is the whole surface
+    today, and the interface does not change what the session does.

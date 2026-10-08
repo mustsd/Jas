@@ -19,8 +19,12 @@ run() {
 run "cargo fmt --check" bash scripts/ainiux/cargo fmt --check
 run "cargo clippy -D warnings" bash scripts/ainiux/cargo clippy --all-targets -- -D warnings
 run "cargo test" bash scripts/ainiux/cargo test
-run "pty layout (real terminal)" python3 scripts/ainiux/pty
-run "pty layout, narrow + CJK" python3 scripts/ainiux/pty scripts/ainiux/pty-narrow.txt -- --status-line
+# Line mode: `--no-tui` is passed explicitly, because a terminal gets the TUI by
+# default and these two assert the line-oriented layout.
+run "pty layout (real terminal)" python3 scripts/ainiux/pty --expect line -- --no-tui
+run "pty layout, narrow + CJK" python3 scripts/ainiux/pty scripts/ainiux/pty-narrow.txt --expect line -- --no-tui --status-line
+# The TUI: no flags, so this is also the check that it is the default at a terminal.
+run "pty TUI (alt screen)" python3 scripts/ainiux/pty scripts/ainiux/pty-tui.txt --expect tui
 run "smoke (end-to-end binary)" bash scripts/ainiux/smoke
 
 exit "$status"

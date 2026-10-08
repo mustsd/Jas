@@ -64,9 +64,11 @@ pub enum KeysChoice {
     long_about = "Plays mp3 and other common audio formats from the command line.\n\
                   Built for shadowing drills: A-B loop, segment repeat, gap, and speed\n\
                   with preserved pitch.\n\n\
-                  With a terminal on stdin you get single-key control and a `:` prompt.\n\
-                  With a pipe or a file you get the same command grammar, one line at a\n\
-                  time, so a drill can be scripted.",
+                  With a terminal at both ends you get a full-screen TUI: the playlist,\n\
+                  the transport, the A-B marks and the message log, with the same keys.\n\
+                  `--no-tui` keeps the line-oriented interface instead, which is what a\n\
+                  pipe, a file, or a redirect gets automatically. Either way the command\n\
+                  grammar is one grammar, reachable by key and by typing it after `:`.",
     after_help = "KEYBOARD (default keymap)\n  \
                   space    play/pause          n / p    next / prev\n  \
                   left/right  seek -/+5s        a / b    mark A / B\n  \
@@ -75,6 +77,8 @@ pub enum KeysChoice {
                   \\        speed 1.0            g        gap +250 ms\n  \
                   l        cycle loop mode      ?        help keys\n  \
                   :        command prompt       q        quit\n\n\
+                  In the TUI the same keys apply; `?` opens the help overlay (Esc closes\n  \
+                  it, up/down scroll it) and the bottom line is the `:` prompt.\n\n\
                   If your terminal is left without echo (only SIGKILL can do that), run:\n  \
                   stty sane"
 )]
@@ -148,9 +152,13 @@ pub struct Cli {
     #[arg(long = "no-keys", action = ArgAction::SetTrue)]
     pub no_keys: bool,
 
-    /// Keep one status line updated in place (TTY only).
+    /// Keep one status line updated in place (line mode, TTY only).
     #[arg(long = "status-line", action = ArgAction::SetTrue)]
     pub status_line: bool,
+
+    /// Start in the line-oriented interface instead of the full-screen TUI.
+    #[arg(long = "no-tui", action = ArgAction::SetTrue)]
+    pub no_tui: bool,
 
     /// Do not read or write resume state.
     #[arg(long = "no-state", action = ArgAction::SetTrue)]
@@ -227,6 +235,8 @@ pub struct Invocation {
     pub keys: Option<KeysChoice>,
     pub hotkeys: bool,
     pub status_line: bool,
+    /// `--no-tui`: the line-oriented interface even on a terminal.
+    pub no_tui: bool,
     pub no_state: bool,
     pub config: Option<PathBuf>,
     pub quiet: bool,
@@ -289,6 +299,7 @@ impl Invocation {
             keys: cli.keys,
             hotkeys,
             status_line: cli.status_line,
+            no_tui: cli.no_tui,
             no_state: cli.no_state,
             config: cli.config,
             quiet: cli.quiet,
@@ -348,6 +359,7 @@ mod tests {
         assert!(!inv.play);
         assert!(inv.hotkeys);
         assert!(!inv.status_line);
+        assert!(!inv.no_tui, "the TUI is the default at a terminal");
         assert!(!inv.no_state);
         assert_eq!(inv.gap, Duration::ZERO);
         assert_eq!(inv.backend, None);
@@ -439,6 +451,16 @@ mod tests {
     }
 
     #[test]
+    fn the_tui_is_the_default_and_no_tui_opts_out() {
+        // "Default on a terminal" is resolved in `main` (it needs to ask whether
+        // there *is* a terminal); the flag layer only records what was asked for.
+        assert!(!ok(&[]).no_tui);
+        assert!(ok(&["--no-tui"]).no_tui);
+        assert!(ok(&["--no-tui", "--status-line"]).status_line);
+        assert!(!ok(&["--no-tui", "--no-keys"]).hotkeys);
+    }
+
+    #[test]
     fn contradictory_actions_are_rejected() {
         assert!(err(&["--play", "--list"]).contains("contradict"));
         assert!(err(&["--json"]).contains("--list"));
@@ -464,6 +486,7 @@ mod tests {
             "--keys",
             "--no-keys",
             "--status-line",
+            "--no-tui",
             "--no-state",
             "--config",
         ] {

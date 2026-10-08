@@ -48,6 +48,14 @@ pub enum Input {
     CancelLine,
     /// Exit with code 130.
     Interrupt,
+    /// A key that neither the active mode nor the keymap claimed.
+    ///
+    /// Hotkey mode used to report this as `Idle`, so the key simply vanished. It is
+    /// reported instead because the TUI (`tui.rs`) is a second consumer of the same
+    /// events and needs exactly the keys the command grammar does not describe -- the
+    /// arrows, to scroll its help overlay. The line-mode loop ignores it, so nothing
+    /// behaves differently there.
+    Chord(Chord),
     /// Nothing yet.
     Idle,
 }
@@ -296,7 +304,9 @@ impl InputLayer {
                 }
                 match keymap.lookup(&chord) {
                     Some(cmd) => Input::Command(cmd.clone()),
-                    None => Input::Idle,
+                    // Not a binding: no command is invented for it, but the key is
+                    // not thrown away either (see `Input::Chord`).
+                    None => Input::Chord(chord),
                 }
             }
         }
@@ -307,6 +317,12 @@ impl InputLayer {
         if self.hotkeys {
             self.mode = Mode::Hotkey;
         }
+    }
+
+    /// True when hotkeys are on, so a caller can describe the interface accurately:
+    /// with them off there is no key layer at all, only the `:` prompt.
+    pub fn hotkeys_on(&self) -> bool {
+        self.hotkeys
     }
 
     /// The prompt to draw before the current command-mode buffer.
@@ -484,11 +500,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unbound_hotkey_does_nothing_rather_than_guessing() {
+    fn an_unbound_hotkey_is_reported_rather_than_guessed() {
         let map = keymap();
         let mut layer = InputLayer::detached();
         layer.mode = Mode::Hotkey;
-        assert_eq!(layer.handle_chord(Chord::char('z'), &map), Input::Idle);
+        // Nothing is invented for `z`: no command runs. The key itself is passed on
+        // rather than discarded, because the TUI is a second consumer of these
+        // events (see `Input::Chord`).
+        assert_eq!(
+            layer.handle_chord(Chord::char('z'), &map),
+            Input::Chord(Chord::char('z'))
+        );
+        assert_eq!(map.lookup(&Chord::char('z')), None);
     }
 
     #[test]
