@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run the test suite and show only the tail, for quick iteration.
+# Usage: bash scripts/ainiux/test [extra cargo test args...]
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+bash scripts/ainiux/cargo test -- "$@" 2>&1 | tail -n 80

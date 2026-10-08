@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Show which backend-dependent tests actually ran vs. skipped.
+# Usage: bash scripts/ainiux/backends
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+
+echo "== installed backends"
+for p in mpv ffplay ffmpeg; do
+  if command -v "$p" >/dev/null 2>&1; then
+    printf '  %-8s %s\n' "$p" "$(command -v "$p")"
+  else
+    printf '  %-8s (not installed)\n' "$p"
+  fi
+done
+
+echo
+echo "== backend-dependent test outcomes"
+bash scripts/ainiux/cargo test -- --nocapture 2>&1 | grep -Ei 'skipping|mpv|ffplay' || true

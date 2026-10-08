@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run the checks PLANS.md section 10 lists for CI.
+# Usage: bash scripts/ainiux/check
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+
+status=0
+run() {
+  local label="$1"; shift
+  echo "== $label"
+  if "$@"; then
+    echo "   ok"
+  else
+    echo "   FAILED" >&2
+    status=1
+  fi
+}
+
+run "cargo fmt --check" bash scripts/ainiux/cargo fmt --check
+run "cargo clippy -D warnings" bash scripts/ainiux/cargo clippy --all-targets -- -D warnings
+run "cargo test" bash scripts/ainiux/cargo test
+run "pty layout (real terminal)" python3 scripts/ainiux/pty
+run "pty layout, narrow + CJK" python3 scripts/ainiux/pty scripts/ainiux/pty-narrow.txt -- --status-line
+run "smoke (end-to-end binary)" bash scripts/ainiux/smoke
+
+exit "$status"

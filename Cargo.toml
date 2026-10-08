@@ -1,0 +1,29 @@
+[package]
+name = "jas"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Local audio player for language learners"
+license = "MIT"
+
+[[bin]]
+name = "jas"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
+ctrlc = "3"
+directories = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+# Display width, not character count: an in-place line must not be painted wider
+# than the terminal, and a CJK character occupies two columns while an Arabic one
+# occupies one. Counting `chars()` would make a Chinese filename in the status line
+# wrap, and a wrapped in-place line leaves debris on the row above it.
+unicode-width = "0.1"
+
+[profile.release]
+lto = true

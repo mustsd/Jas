@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run cargo with the rustup toolchain on PATH.
+# The agent's `run` tool uses a fixed PATH that excludes ~/.cargo/bin.
+set -euo pipefail
+
+export PATH="${HOME}/.cargo/bin:${PATH}"
+export CARGO_TERM_COLOR=never
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+
+exec cargo "$@"

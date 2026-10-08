@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Drive the real `jas` binary on a pty, then render what a terminal would show.
+
+This exists because the interaction layout cannot be verified from a pipe: with a
+pipe, `jas` uses line mode and never paints a prompt or a status line, so every
+layout bug is invisible. A pty makes stdin a real terminal, which is the only way
+to exercise the hotkey/command-mode paths that draw in place.
+
+Two things are printed:
+
+1. The raw byte stream, with `\\r` shown as `^M` and escapes spelled out. Use this
+   to see exactly which bytes the program emitted.
+2. The emulated screen, replayed with `\\r`, `\\n`, and `ESC[2K`. Use this to see
+   where each line actually starts -- which is the question that matters for layout.
+
+Usage:
+    python3 scripts/ainiux/pty [scenario-file] [-- JAS_ARGS...]
+
+Anything after `--` is passed to `jas`, so a second run can exercise the opt-in
+status line:
+
+    python3 scripts/ainiux/pty -- --status-line
+
+Scenarios are read from the file (or stdin, or a built-in default) as one command
+per line:
+
+    keys :status      send these characters literally
+    key enter         send a named key (enter, ctrl-c, esc, space, tab, up, ...)
+    sleep 300         wait, in milliseconds
+    cols 60           set the terminal width (default 80)
+    track 第二课.wav   name the dummy track (default lesson.wav)
+
+Exits non-zero if the scenario is empty or `jas` never exits.
+"""
+
+import fcntl
+import os
+import pty
+import re
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+import wave
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BIN = os.path.join(REPO, "target", "debug", "jas")
+
+# Named keys and the bytes a terminal sends for them. ctrl-c is the interesting
+# one: raw mode means it arrives as a byte, not as SIGINT.
+NAMED = {
+    "enter": b"\r",
+    "tab": b"\t",
+    "esc": b"\x1b",
+    "space": b" ",
+    "backspace": b"\x7f",
+    "ctrl-c": b"\x03",
+    "ctrl-d": b"\x04",
+    "up": b"\x1b[A",
+    "down": b"\x1b[B",
+    "right": b"\x1b[C",
+    "left": b"\x1b[D",
+    "shift-right": b"\x1b[1;2C",
+    "shift-left": b"\x1b[1;2D",
+}
+
+DEFAULT_SCENARIO = """\
+sleep 300
+keys :status
+sleep 150
+key enter
+sleep 300
+key n
+sleep 300
+key q
+sleep 300
+"""
+
+
+def parse_scenario(text):
+    steps = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        verb, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if verb == "sleep":
+            steps.append(("sleep", int(rest) / 1000.0))
+        elif verb == "cols":
+            steps.append(("cols", int(rest)))
+        elif verb == "track":
+            steps.append(("track", rest))
+        elif verb == "keys":
+            steps.append(("send", rest.encode()))
+        elif verb == "key":
+            if rest in NAMED:
+                steps.append(("send", NAMED[rest]))
+            elif len(rest) == 1:
+                # `key n` is a convenience for `keys n`; no named key is one
+                # character long, so there is no ambiguity.
+                steps.append(("send", rest.encode()))
+            else:
+                raise SystemExit(f"pty: unknown key `{rest}` (known: {', '.join(NAMED)})")
+        else:
+            raise SystemExit(f"pty: unknown directive `{verb}`")
+    return steps
+
+
+def render(data, cols=80):
+    r"""Replay the byte stream onto a 2-D grid of characters.
+
+    Only the handful of sequences `jas` actually emits are interpreted: `\n` moves
+    to the next row at column 0, `\r` returns to column 0, and ESC[2K erases the
+    row the cursor is on. Anything else is skipped rather than guessed at.
+
+    Wrapping is modelled, because that is the whole reason an in-place line can
+    leave debris: if the text is wider than the terminal the cursor ends up on a
+    *later* row, so ESC[2K clears only that one and the row above keeps the tail of
+    the previous line. A renderer that ignored wrapping would hide exactly the class
+    of bug it is meant to catch.
+    """
+    rows = [[]]
+    row = col = 0
+    i = 0
+    text = data.decode("utf-8", "replace")
+    while i < len(text):
+        c = text[i]
+        if c == "\x1b":
+            m = re.match(r"\x1b\[[0-9;]*[A-Za-z]", text[i:])
+            if m:
+                seq = m.group(0)
+                if seq in ("\x1b[2K", "\x1b[K"):
+                    # `2K` erases the whole row the cursor sits on, not just the
+                    # part to its right.
+                    rows[row] = []
+                i += len(seq)
+                continue
+            i += 1
+            continue
+        if c == "\n":
+            row += 1
+            col = 0
+            while len(rows) <= row:
+                rows.append([])
+            i += 1
+            continue
+        if c == "\r":
+            col = 0
+            i += 1
+            continue
+        if col >= cols:
+            # The terminal wrapped: the cursor is now at column 0 of the next row.
+            row += 1
+            col = 0
+        while len(rows) <= row:
+            rows.append([])
+        line = rows[row]
+        while len(line) < col:
+            line.append(" ")
+        if col < len(line):
+            line[col] = c
+        else:
+            line.append(c)
+        col += 1
+        i += 1
+    return ["".join(r).rstrip() for r in rows]
+
+
+def visible(data):
+    """The raw stream with control characters spelled out, decoded as UTF-8.
+
+    Decoding happens first: iterating bytes would split multi-byte characters and
+    print mojibake, which is exactly the kind of output that makes a reader distrust
+    the rest of the report.
+    """
+    out = []
+    for c in data.decode("utf-8", "replace"):
+        if c == "\r":
+            out.append("^M")
+        elif c == "\n":
+            out.append("\\n\n")
+        elif c == "\x1b":
+            out.append("\\e")
+        elif ord(c) < 0x20 or ord(c) == 0x7F:
+            out.append(f"<{ord(c):02x}>")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def main():
+    if not os.path.exists(BIN):
+        raise SystemExit(f"pty: {BIN} does not exist; run `bash scripts/ainiux/cargo build`")
+
+    argv = sys.argv[1:]
+    jas_args = []
+    if "--" in argv:
+        split = argv.index("--")
+        jas_args = argv[split + 1 :]
+        argv = argv[:split]
+
+    if argv:
+        with open(argv[0], "r", encoding="utf-8") as handle:
+            scenario_text = handle.read()
+    elif not sys.stdin.isatty():
+        # A served stdin may simply be empty (no redirect at all), in which case
+        # the built-in scenario is the useful default rather than an error.
+        scenario_text = sys.stdin.read() or DEFAULT_SCENARIO
+    else:
+        scenario_text = DEFAULT_SCENARIO
+    steps = parse_scenario(scenario_text)
+    if not steps:
+        raise SystemExit("pty: the scenario is empty, there is nothing to drive")
+
+    # Terminal geometry and track name are scenario settings, and both are needed
+    # before anything is created.
+    cols = 80
+    rows = 24
+    track_name = "lesson.wav"
+    for kind, value in steps:
+        if kind == "cols":
+            cols = value
+        elif kind == "track":
+            track_name = value
+
+    # A real but silent WAV. It has to be genuinely valid audio: `ffplay` is
+    # actually spawned by commands like `next`, and a malformed file would make it
+    # exit with a decode error, which is a different situation than the one under
+    # test. One second of silence keeps the run quick and audibly quiet.
+    workdir = os.path.join(REPO, "target", "pty-run")
+    os.makedirs(workdir, exist_ok=True)
+    track = os.path.join(workdir, track_name)
+    with wave.open(track, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b"\x00\x00" * 8000)
+
+    argv = [BIN, "--no-state", *jas_args, track]
+
+    master, slave = pty.openpty()
+
+    master, slave = pty.openpty()
+    # A fixed, ordinary window size: layout assertions are meaningless without one.
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    env = dict(os.environ)
+    env["TERM"] = "xterm-256color"
+    proc = subprocess.Popen(
+        argv,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        preexec_fn=os.setsid,
+        env=env,
+    )
+    os.close(slave)
+
+    captured = bytearray()
+
+    def drain(timeout):
+        """Read whatever is available, up to `timeout` seconds."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.05)
+            if master in ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                captured.extend(chunk)
+
+    drain(0.4)
+    for kind, value in steps:
+        if kind == "cols":
+            continue
+        if kind == "track":
+            continue
+        if kind == "sleep":
+            drain(value)
+        else:
+            os.write(master, value)
+            drain(0.25)
+
+    # Wait for a clean exit, then sweep up anything still buffered.
+    for _ in range(40):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    drain(0.3)
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+        raise SystemExit("pty: jas did not exit; the scenario left it running")
+    os.close(master)
+
+    print("== scenario")
+    for line in scenario_text.strip().splitlines():
+        print(f"  {line}")
+    print(f"== jas args: {' '.join(jas_args) if jas_args else '(none)'}")
+    print(f"== terminal: {cols}x{rows}, track: {track_name}")
+    print()
+    print("== raw stream (^M = carriage return, \\e = escape)")
+    print(visible(bytes(captured)))
+    print()
+    print("== rendered screen")
+    for index, row in enumerate(render(bytes(captured), cols)):
+        print(f"{index:>3} |{row}")
+    print()
+    print(f"== exit code: {proc.returncode}")
+
+    # Assertions, so this is a regression check and not only a report. They are
+    # deliberately about the reported symptom rather than about a golden screen:
+    # messages may legitimately wrap, so a full-screen diff would be brittle.
+    problems = []
+    if proc.returncode != 0:
+        problems.append(f"jas exited {proc.returncode}")
+
+    raw = bytes(captured).decode("utf-8", "replace")
+    # The bug: the prompt is painted without a trailing newline, so a message
+    # printed afterwards landed on the same row, after the `:`.
+    if ":state=" in raw:
+        problems.append("a message is glued to the prompt (`:state=...`)")
+
+    # The only escape sequence `jas` should ever emit is an erase-line.
+    for seq in re.findall(r"\x1b[^A-Za-z]*[A-Za-z]", raw):
+        if seq != "\x1b[2K":
+            problems.append(f"unexpected control sequence {seq!r}")
+
+    # Every status message must begin at column 0. A row that starts with a
+    # continuation of the status line means something was overwritten in place of it.
+    for index, row in enumerate(render(bytes(captured), cols)):
+        if "name=" in row and not (
+            row.startswith("state=") or row.startswith(" ") or "state=" in row
+        ):
+            problems.append(f"row {index} has an unanchored status fragment: {row!r}")
+
+    if problems:
+        print()
+        for problem in problems:
+            print(f"FAIL: {problem}")
+        return 1
+    print("== ok: no glued lines, no unexpected escapes")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

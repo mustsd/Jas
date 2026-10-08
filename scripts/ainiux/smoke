@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# End-to-end smoke test for the built binary.
+#
+# Generates short tones with ffmpeg, then drives the real `jas` binary through
+# the scriptable (piped stdin) path and checks exit codes and output. Skips
+# cleanly when ffmpeg or a backend is missing.
+#
+# Usage: bash scripts/ainiux/smoke
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+
+BIN=target/debug/jas
+if [ ! -x "$BIN" ]; then
+  echo "smoke: run 'bash scripts/ainiux/cargo build' first" >&2
+  exit 2
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "smoke: skipped (ffmpeg is not installed, cannot generate test audio)"
+  exit 0
+fi
+
+WORK=$(mktemp -d)
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+fail=0
+check() { # check <label> <expected> <actual>
+  if [ "$2" = "$3" ]; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1 (expected $2, got $3)"
+    fail=1
+  fi
+}
+
+mkdir -p "$WORK/audio"
+for f in ch1 ch2 ch10; do
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "sine=frequency=440:duration=2" "$WORK/audio/$f.wav" || exit 3
+done
+# A non-ASCII name, to prove paths survive end to end.
+ffmpeg -hide_banner -loglevel error -y \
+  -f lavfi -i "sine=frequency=330:duration=2" "$WORK/audio/第二课.wav" || exit 3
+
+echo "smoke: --version"
+check "exit 0" 0 "$("$BIN" --version >/dev/null 2>&1; echo $?)"
+
+echo "smoke: --list is a one-shot that needs no backend"
+out=$("$BIN" --list "$WORK/audio" 2>/dev/null)
+check "exit 0" 0 "$?"
+check "lists 4 tracks" 4 "$(printf '%s\n' "$out" | grep -c .)"
+check "natural sort: ch1 first" "ch1.wav" "$(printf '%s\n' "$out" | sed -n '1p' | awk '{print $2}' | xargs basename)"
+check "natural sort: ch10 before ch2" "ch2.wav" "$(printf '%s\n' "$out" | sed -n '2p' | awk '{print $2}' | xargs basename)"
+check "natural sort: ch10 third" "ch10.wav" "$(printf '%s\n' "$out" | sed -n '3p' | awk '{print $2}' | xargs basename)"
+
+echo "smoke: --list --json"
+"$BIN" --list --json "$WORK/audio" >"$WORK/list.json" 2>/dev/null
+check "exit 0" 0 "$?"
+if command -v python3 >/dev/null 2>&1; then
+  n=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$WORK/list.json" 2>/dev/null)
+  check "valid JSON with 4 entries" 4 "$n"
+fi
+
+echo "smoke: --doctor"
+"$BIN" --doctor >/dev/null 2>&1
+check "exit 0" 0 "$?"
+
+echo "smoke: scripted drill (status, seek, ab, speed, quit)"
+printf 'status\nseek +0.5\nab 0:00.200 0:01.000\nspeed 0.75\nrepeat 2\nstatus\nquit\n' \
+  >"$WORK/drill.txt"
+"$BIN" --play --no-state "$WORK/audio/ch1.wav" <"$WORK/drill.txt" >"$WORK/drill.out" 2>&1
+check "exit 0" 0 "$?"
+check "both status lines are machine readable" 2 "$(grep -c '^state=playing' "$WORK/drill.out")"
+check "speed reached the session" 1 "$(grep -c '^speed 0.75$' "$WORK/drill.out")"
+check "ab reached the session" 1 "$(grep -c 'A-B 0:00-0:01' "$WORK/drill.out")"
+
+echo "smoke: a bad command is reported without aborting the run"
+printf 'seek nonsense\nstatus\nquit\n' >"$WORK/bad.txt"
+"$BIN" --play --no-state "$WORK/audio/ch1.wav" <"$WORK/bad.txt" >"$WORK/bad.out" 2>&1
+check "exit 0" 0 "$?"
+check "error reported" 1 "$(grep -c 'seek:' "$WORK/bad.out")"
+check "session continued" 1 "$(grep -c '^state=' "$WORK/bad.out")"
+
+echo "smoke: usage errors exit 1"
+"$BIN" --ab-b 0:10 "$WORK/audio/ch1.wav" >/dev/null 2>&1
+check "exit 1" 1 "$?"
+"$BIN" --speed 99 "$WORK/audio/ch1.wav" >/dev/null 2>&1
+check "exit 1" 1 "$?"
+
+echo "smoke: no playable input exits 3"
+"$BIN" --list "$WORK/does-not-exist" >/dev/null 2>&1
+check "exit 3" 3 "$?"
+
+echo "smoke: non-ASCII path"
+"$BIN" --list "$WORK/audio/第二课.wav" >/dev/null 2>&1
+check "exit 0" 0 "$?"
+
+echo "smoke: state is written and resumed"
+CFG="$WORK/cfg"
+printf 'play\nquit\n' >"$WORK/short.txt"
+"$BIN" --play --config "$CFG" "$WORK/audio/ch1.wav" <"$WORK/short.txt" >/dev/null 2>&1
+check "state file written" 1 "$([ -f "$CFG/state.json" ] && echo 1 || echo 0)"
+if command -v python3 >/dev/null 2>&1; then
+  tracks=$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(len(d.get('tracks',{})))
+" "$CFG/state.json" 2>/dev/null)
+  check "one track remembered" 1 "$tracks"
+fi
+
+if [ "$fail" = 0 ]; then
+  echo "smoke: all checks passed"
+else
+  echo "smoke: FAILURES above" >&2
+fi
+exit "$fail"

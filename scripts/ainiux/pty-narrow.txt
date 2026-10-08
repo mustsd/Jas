@@ -1,0 +1,14 @@
+# A narrow terminal and a double-width filename: the case that makes display width
+# (rather than character count) the right measurement. At 40 columns the status line
+# cannot fit, so it has to be fitted to one row and cut at a field boundary.
+#
+# Driven by `bash scripts/ainiux/check` as a regression check.
+cols 40
+track 第二课.wav
+sleep 300
+keys :status
+sleep 150
+key enter
+sleep 400
+key q
+sleep 300
